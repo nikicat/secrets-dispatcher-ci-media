@@ -1,0 +1,108 @@
+name: GC
+
+# This repo is a throwaway media sidecar: the secrets-dispatcher Demos workflow
+# publishes one recording set per PR (pr-<N>/) and per master push (latest/).
+# Left alone they accumulate forever — and because deleted files stay reachable
+# in git history, a plain `git rm` never shrinks the repo (the .git dir already
+# dwarfs the working tree). This job keeps the repo size manageable:
+#
+#   * keep everything that isn't a per-PR recording (README, .nojekyll, latest/),
+#   * keep the NEWEST pr-<N>/ dirs that fit under MAX_MB, drop the oldest,
+#   * rewrite main to a single orphan commit of exactly the kept paths, so the
+#     dropped recordings AND their history blobs are gone.
+#
+# History has no value here, so the force-push is intentional. Runs weekly and
+# on demand (with a tunable budget).
+
+on:
+  schedule:
+    - cron: '27 4 * * 1' # Mondays 04:27 UTC
+  workflow_dispatch:
+    inputs:
+      max_mb:
+        description: 'Size budget in MB (keep newest recordings up to this)'
+        default: '100'
+
+concurrency:
+  # Never two rewrites at once, and never cancel one mid-push.
+  group: gc
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      MAX_MB: ${{ github.event.inputs.max_mb || '100' }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0 # need full history to date each dir and to count commits
+
+      - name: Prune oldest recordings over the size budget
+        run: |
+          set -euo pipefail
+          shopt -s dotglob nullglob
+          budget=$(( MAX_MB * 1024 * 1024 ))
+          dirsize() { du -sb --exclude=.git "$1" | cut -f1; }
+
+          # Split the top level into always-keep (everything that isn't a
+          # pr-<number>/ recording) and prunable recording dirs.
+          keep=()
+          recordings=()
+          for e in *; do
+            case "$e" in
+              .git) continue ;;
+            esac
+            if [[ -d "$e" && "$e" =~ ^pr-[0-9]+$ ]]; then
+              recordings+=("$e")
+            else
+              keep+=("$e")
+            fi
+          done
+
+          # Recording dirs newest-first, by the commit that last touched each.
+          mapfile -t recordings < <(
+            for d in "${recordings[@]}"; do
+              printf '%s\t%s\n' "$(git log -1 --format=%ct -- "$d")" "$d"
+            done | sort -rn | cut -f2
+          )
+
+          # Greedily keep the newest recordings that fit alongside the
+          # always-keep set; the rest (oldest) are dropped.
+          running=0
+          for e in "${keep[@]}"; do running=$(( running + $(dirsize "$e") )); done
+          dropped=()
+          for d in "${recordings[@]}"; do
+            dsz=$(dirsize "$d")
+            if [ $(( running + dsz )) -le "$budget" ]; then
+              keep+=("$d"); running=$(( running + dsz ))
+            else
+              dropped+=("$d")
+            fi
+          done
+
+          # A rewrite is worth it only if we are dropping something or history
+          # has piled up (only a rewrite reclaims blobs from deleted files).
+          commits=$(git rev-list --count HEAD)
+          if [ ${#dropped[@]} -eq 0 ] && [ "$commits" -le 1 ]; then
+            echo "under ${MAX_MB}MB and history already compact (${commits} commit); nothing to do"
+            exit 0
+          fi
+
+          echo "keep ($(( running / 1024 / 1024 ))MB): ${keep[*]}"
+          [ ${#dropped[@]} -gt 0 ] && echo "drop oldest: ${dropped[*]}"
+          echo "compact history: ${commits} commit(s) -> 1"
+
+          # Rebuild main as a single orphan commit of exactly the kept paths.
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git checkout -q --orphan gc-fresh
+          git reset -q            # clear the staged index; working tree untouched
+          git add -- "${keep[@]}"
+          git commit -qm "gc: keep newest recordings under ${MAX_MB}MB"
+          git branch -qM gc-fresh main
+          git push -q --force origin main
